@@ -1,13 +1,24 @@
 #!/bin/sh
 
+URLBASIC="https://plex.tv/api/downloads/5.json"
+DOWNLOADPATH="/Plex"
+LOGPATH="/Plex"
+LOGFILE="PMS_Updater.log"
+PMSPARENTPATH="/usr/local/share"
+PMSLIVEFOLDER="plexmediaserver"
+PMSBAKFOLDER="plexmediaserver.bak"
+CERTFILE="/usr/local/share/certs/ca-root-nss.crt"
 AUTOUPDATE=1
 FORCEUPDATE=0
 VERBOSE=1
 REMOVE=1
 LOGGING=1
-
+#PLEXPASS="/Plex/plexpass.txt"
+PLEXPASS=0
+#PLEXTOKEN="$(sed -n 's/.*PlexOnlineToken="//p' "${PREFS}" | sed 's/\".*//')"
+TOKENURL="$BASEURL?channel=plexpass&X-Plex-Token=$PLEXTOKEN"
+PMSPATTERN="PlexMediaServer-[0-9]*.[0-9]*.[0-9]*.[0-9]*-[0-9,a-f]*-FreeBSD-amd64.tar.bz2"
 # Try to find the Preferences.xml in all possible folders to fetch the token for downloads of PlexPass versions.
-
 if [ -f /Plex\ Media\ Server/Preferences.xml ]; then
         PREFS="/Plex Media Server/Preferences.xml"
 elif
@@ -23,19 +34,9 @@ else
    echo "Preferences.xml not found. This will likely prevent the script from downloading the latest version of Plex. You can still manually download Plex and run PMS_Updater.sh with the -l flag."
 fi
 
-PLEXTOKEN="$(sed -n 's/.*PlexOnlineToken="//p' "${PREFS}" | sed 's/\".*//')"
-BASEURL="https://plex.tv/api/downloads/5.json"
-TOKENURL="$BASEURL?channel=plexpass&X-Plex-Token=$PLEXTOKEN"
-DOWNLOADPATH="/tmp"
-LOGPATH="/tmp"
-LOGFILE="PMS_Updater.log"
-PMSPARENTPATH="/usr/local/share"
-PMSPATTERN="PlexMediaServer-[0-9]*.[0-9]*.[0-9]*.[0-9]*-[0-9,a-f]*-FreeBSD-amd64.tar.bz2"
-
 # Initialize CURRENTVER to the script max so if reading the current version fails
 # for some reason we don't blindly clobber things
 CURRENTVER=9999.9999.9999.9999.9999
-
 
 usage()
 {
@@ -47,6 +48,18 @@ and if it is newer than the currently installed version the script will
 download and optionaly install the new version.
 
 OPTIONS:
+   -u      PlexPass username
+             If -u is specified without -p then the script will
+             prompt the user to enter the password when needed
+   -p      PlexPass password
+   -c      PlexPass user/password file
+             When wget is run with username and password on the
+             command line, that information is displayed in the
+             process list for all to see.  A more secure method
+             is to create a file readable only by root that is
+             formatted like this:
+               user={Your Username Here}
+               password={Your Password Here}
    -l      Local file to install instead of latest from Plex.tv
    -d      download folder (default /tmp) Ignored if -l is used
    -a      Auto Update to newer version
@@ -57,6 +70,7 @@ OPTIONS:
    -n      Use normal version (not PlexPass) version
 EOF
 }
+
 
 ##  LogMsg()
 ##  READS:     STDIN (Piped input) $1 (passed in string) $LOGPATH $LOGFILE
@@ -72,9 +86,6 @@ LogMsg()
       if [ $VERBOSE = 1 ] || [ "$1" = "-f" ]; then echo $SWITCH $IN; fi
     done
 }
-
-
-
 
 ##  verNum()
 ##  READS:    $1 (passed in string)
@@ -118,25 +129,45 @@ removeOlder()
 }
 
 
+
 ##  webFetch()
-##  READS:    $1 (URL) $DOWNLOADPATH $VERBOSE $LOGGING
+##  READS:    $1 (URL) $DOWNLOADPATH $USERPASSFILE $USERNAME $PASSWORD $VERBOSE $LOGGING
 ##  MODIFIES: NONE
 ##
 ##  invoke wget with configured account info
-
 webFetch()
 {
+    local LOGININFO=""
     local QUIET="-q"
 
-    if [ $VERBOSE = 1 ]; then QUIET=""; fi
-    echo Downloading $1 | LogMsg
-    fetch $QUIET -o "$DOWNLOADPATH/" "$1" >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo Error downloading $1
-        exit 1
-    else
-        echo Download Complete | LogMsg
+    # Check if PlexPass is set and handle user/pass file or direct credentials
+    if [ $PLEXPASS = 1 ]; then
+        if [ ! "x$USERPASSFILE" = "x" ] && [ -e $USERPASSFILE ]; then
+            LOGININFO="--config=$USERPASSFILE"
+        elif [ ! "x$USERNAME" = "x" ]; then
+            if [ "x$PASSWORD" = "x" ]; then
+                LOGININFO="--http-user=$USERNAME --ask-password"
+            else
+                LOGININFO="--http-user=$USERNAME --http-password=$PASSWORD"
+            fi
+        fi
     fi
+
+    # Adjust verbosity
+    if [ $VERBOSE = 1 ]; then QUIET=""; fi
+
+    # Log and execute the fetch command
+    echo "Downloading $1..." | LogMsg
+    fetch $QUIET $LOGININFO -o "$DOWNLOADPATH/$(basename "$1")" "$1"
+    
+    # Check for errors during download
+    if [ $? -ne 0 ]; then
+        echo "Error downloading $1" | LogMsg
+        echo
+        exit 1
+    fi
+    echo "Download Complete" | LogMsg
+    echo
 }
 
 ##  findLatest()
@@ -144,22 +175,28 @@ webFetch()
 ##  MODIFIES: $DOWNLOADURL
 ##
 ##  connects to the Plex.tv download site and scrapes for the latest download link
-findLatest()
-{
-    if [ $VERBOSE = 1 ]; then echo Using URL $BASEURL; fi
+findLatest() {
+    if [ $PLEXPASS = 1 ]; then local URL=$URLPLEXPASS; else local URL=$URLBASIC; fi
+    if [ $VERBOSE = 1 ]; then echo; echo Using URL $URL ;fi
+    SCRAPEFILE="$DOWNLOADPATH/plex_downloads.json"
+    echo 
+    echo Searching $URL for the FreeBSD download URL .....; echo | LogMsg -n
+    fetch -o "$SCRAPEFILE" "$URLBASIC"
 
-    echo Searching $BASEURL for the FreeBSD download URL ..... | LogMsg -n
-    DOWNLOADURL="$(fetch -q $TOKENURL -o- | $PMSPARENTPATH/$PMSLIVEFOLDER/Plex\ Script\ Host -c 'import sys, json; myobj = json.load(sys.stdin); print(myobj["computer"]["FreeBSD"]["releases"][0]["url"]);')"
+    if [ $? -ne 0 ]; then
+        echo "Failed to download Plex version info." | LogMsg
+        exit 1
+    fi
 
-    if [ "x$DOWNLOADURL" = "x" ]; then {
-        # DOWNLOADURL is zero length, i.e. nothing matched PMSPATTERN. Error and exit
-        echo Could not find a FreeBSD download link on page $TOKENURL | LogMsg -f
+    DOWNLOADURL=$(jq -r '.computer.FreeBSD.releases[0].url' "$SCRAPEFILE")
+
+    if [ -z "$DOWNLOADURL" ]; then {
+        echo "Could not find a FreeBSD download link in JSON data" | LogMsg -f
         exit 1
     } else {
-        echo Done. | LogMsg -f
+        echo; echo "Found FreeBSD download URL: $DOWNLOADURL"; echo | LogMsg
     } fi
 }
-
 
 ##  applyUpdate()
 ##  READS:    $PMSPARENTPATH $PMSLIVEFOLDER $PMSBAKFOLDER $LOCALINSTALLFILE $VERBOSE $LOGGING
@@ -179,12 +216,15 @@ applyUpdate()
     echo Removing previous PMS Backup ..... | LogMsg -n
     rm -rf $PMSPARENTPATH/$PMSBAKFOLDER 2>&1 | LogMsg
     echo Done. | LogMsg -f
+    echo 
     echo Stopping Plex Media Server .....| LogMsg -n
-    service $SERVICENAME stop 2>&1
+    service plexmediaserver stop 2>&1
     echo Done. | LogMsg -f
+    echo 
     echo Moving current Plex Media Server to backup location .....| LogMsg -n
     mv $PMSPARENTPATH/$PMSLIVEFOLDER/ $PMSPARENTPATH/$PMSBAKFOLDER/ 2>&1 | LogMsg
     echo Done. | LogMsg -f
+    echo 
     echo Extracting $LOCALINSTALLFILE .....| LogMsg -n
     mkdir $PMSPARENTPATH/$PMSLIVEFOLDER/ 2>&1 | LogMsg
     tar -xj --strip-components 1 --file $LOCALINSTALLFILE --directory $PMSPARENTPATH/$PMSLIVEFOLDER/ 2>&1 | LogMsg -f
@@ -193,17 +233,28 @@ applyUpdate()
         rm -rf $PMSPARENTPATH/$PMSLIVEFOLDER/ 2>&1 | LogMsg -f
         mv $PMSPARENTPATH/$PMSBAKFOLDER/ $PMSPARENTPATH/$PMSLIVEFOLDER/ 2>&1 | LogMsg -f
     } else {
+        echo 
         echo Done. | LogMsg -f
     } fi
     ln -s $PMSPARENTPATH/$PMSLIVEFOLDER/Plex\ Media\ Server $PMSPARENTPATH/$PMSLIVEFOLDER/Plex_Media_Server 2>&1 | LogMsg
+    ln -s $PMSPARENTPATH/$PMSLIVEFOLDER/libpython2.7.so.1 $PMSPARENTPATH/$PMSLIVEFOLDER/libpython2.7.so 2>&1 | LogMsg
     echo Starting Plex Media Server .....| LogMsg -n
-    service $SERVICENAME start
+    service plexmediaserver start
+#    if ! service plexmediaserver status; then
+#    if ! ps aux | grep plexmediaserver; then
+#    echo "Plex did not start correctly. Rolling back to previous version." | LogMsg -f
+    # Rollback logic here
+#   fi
     echo Done. | LogMsg -f
+    echo 
 }
 
-while getopts x."l:d:afvrn" OPTION
+while getopts x."u:p:c:l:d:afvrn" OPTION
 do
      case $OPTION in
+         u) USERNAME=$OPTARG ;;
+         p) PASSWORD=$OPTARG ;;
+         c) USERPASSFILE=$OPTARG ;;
          l) LOCALINSTALLFILE=$OPTARG ;;
          d) DOWNLOADPATH=$OPTARG ;;
          a) AUTOUPDATE=1 ;;
@@ -215,24 +266,8 @@ do
      esac
 done
 
-if [ -d "${PMSPARENTPATH}/plexmediaserver-plexpass" ]; then {
-        PLEXPASS=1
-        PMSLIVEFOLDER="plexmediaserver-plexpass"
-        PMSBAKFOLDER="plexmediaserver-plexpass.bak"
-        SERVICENAME="plexmediaserver_plexpass"
-} else {
-        PLEXPASS=0
-        PMSLIVEFOLDER="plexmediaserver"
-        PMSBAKFOLDER="plexmediaserver.bak"
-        SERVICENAME="plexmediaserver"
-} fi
-
-
-export PYTHONHOME="$PMSPARENTPATH/$PMSLIVEFOLDER/Resources/Python"
-export PYTHONPATH="$PYTHONHOME/python27.zip"
-
 # Get the current version
-CURRENTVER=`export LD_LIBRARY_PATH=$PMSPARENTPATH/$PMSLIVEFOLDER/lib; $PMSPARENTPATH/$PMSLIVEFOLDER/Plex\ Media\ Server --version`
+CURRENTVER=`export LD_LIBRARY_PATH=$PMSPARENTPATH/$PMSLIVEFOLDER; $PMSPARENTPATH/$PMSLIVEFOLDER/Plex\ Media\ Server --version`
 if [ $REMOVE = 1 ]; then removeOlder; fi
 
 if [ "x$LOCALINSTALLFILE" = "x" ]; then {
@@ -242,12 +277,14 @@ if [ "x$LOCALINSTALLFILE" = "x" ]; then {
         webFetch "$DOWNLOADURL"  || exit $?
         LOCALINSTALLFILE="$DOWNLOADPATH/`basename $DOWNLOADURL`"
     } else {
-        echo Already running latest version $CURRENTVER | LogMsg
-                exit
+        echo Already running latest version $CURRENTVER, Use -f to force reinstall. | LogMsg
+        
+        exit
     } fi
 } elif [ ! $FORCEUPDATE = 1 ] &&  [ $(verNum `basename $LOCALINSTALLFILE`) -le $(verNum $CURRENTVER) ]; then {
     echo Already running version $CURRENTVER | LogMsg
     echo Use -f to force install $LOCALINSTALLFILE | LogMsg
+    echo 
     exit
 } fi
 
