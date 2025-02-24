@@ -27,4 +27,3 @@ AUTOMATIC
 cd / && ./PPMS_Updater.sh
 
               To change this login announcement, see /var/run/motd.
-
